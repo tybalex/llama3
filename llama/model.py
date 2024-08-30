@@ -2,8 +2,8 @@
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
 import math
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -20,6 +20,8 @@ from torch import nn
 class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
+    n_basemodel_layer: int = 32
+    mob_layers: List[int] = field(default_factory=list)
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1
@@ -252,8 +254,10 @@ class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
+        self.n_basemodel_layer = params.n_basemodel_layer
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.mob_layers = params.mob_layers
 
         self.tok_embeddings = VocabParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
@@ -274,8 +278,10 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
+        # self.gate_network = xxx
+
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, switch: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -283,6 +289,8 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
+            
+
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
 
             mask = torch.triu(mask, diagonal=1)
@@ -295,8 +303,17 @@ class Transformer(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+
+        for idx,layer in enumerate(self.layers):
+            if idx < self.n_basemodel_layer:
+                if idx in self.mob_layers and switch:
+                    mi = self.mob_layers.index(idx)
+                    h = self.layers[self.n_basemodel_layer + mi](h, start_pos, freqs_cis, mask)
+                else:
+                    h = layer(h, start_pos, freqs_cis, mask)
+
         h = self.norm(h)
         output = self.output(h).float()
         return output
+    
+

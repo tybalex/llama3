@@ -85,7 +85,8 @@ class Llama:
             sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
-        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        checkpoints = sorted(Path(ckpt_dir).glob("*consolidated.00.pth"))
+        
         assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
         assert model_parallel_size == len(
             checkpoints
@@ -94,6 +95,21 @@ class Llama:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
+
+        
+        finetuned_checkpoints = sorted(Path(ckpt_dir).glob("*finetuned_layers.pth"))
+        if len(finetuned_checkpoints)> 0:
+            finetuned_checkpoint = torch.load(finetuned_checkpoints[get_model_parallel_rank()], map_location="cpu")
+            mob_layers = params["mob_layers"]
+            # rename keys and append to main checkpoint dict
+            for i, m in enumerate(mob_layers):
+                for k in finetuned_checkpoint.keys():
+                    if k.startswith(f"layers.{m}"):
+                        checkpoint[k.replace(f"layers.{m}", f"layers.{params['n_basemodel_layer'] + i}")] = finetuned_checkpoint[k]
+                
+            # ##TEST ONLY
+            # for k in finetuned_checkpoint:
+            #     checkpoint[k] = finetuned_checkpoint[k]
 
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
@@ -107,7 +123,9 @@ class Llama:
         else:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
         model = Transformer(model_args)
+        
         model.load_state_dict(checkpoint, strict=False)
+        # model.load_state_dict(finetuned_checkpoint)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -126,6 +144,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
+        switch: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -166,7 +185,7 @@ class Llama:
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
+            logits = self.model.forward(tokens, prev_pos, switch=switch)
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -177,7 +196,7 @@ class Llama:
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos,switch=switch)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -284,6 +303,7 @@ class Llama:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
+        switch: bool = False,
     ) -> List[ChatPrediction]:
         """
         Generate assistant responses for a list of conversational dialogs using the language generation model.
@@ -316,6 +336,7 @@ class Llama:
             temperature=temperature,
             top_p=top_p,
             logprobs=logprobs,
+            switch=switch,
         )
         if logprobs:
             return [
